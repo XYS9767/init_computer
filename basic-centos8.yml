@@ -1,0 +1,223 @@
+---
+- hosts: all
+  remote_user: root
+  become: yes
+  tasks:
+    # 1. 暴力清理所有YUM仓库配置
+    - name: Remove ALL YUM repo files
+      shell: rm -f /etc/yum.repos.d/*.repo
+      args:
+        executable: /bin/bash
+      when: 
+        - ansible_os_family == "RedHat" 
+        - ansible_distribution_major_version == "8"
+
+    # 2. 复制change_hostname_ip.sh脚本到远程主机
+    - name: Copy change_hostname_ip.sh to remote host
+      copy:
+        src: ./change_hostname_ip.sh  # 本地脚本路径，相对于Playbook所在目录
+        dest: /root/change_hostname_ip.sh  # 远程主机目标路径
+        mode: '0755'  # 赋予执行权限
+      when: 
+        - ansible_os_family == "RedHat" 
+        - ansible_distribution_major_version == "8"
+
+    # 3. 精准获取活跃非回环网卡
+    - name: Get active non-loopback network interface
+      shell: |
+        ip -br addr show up | grep -v -E 'LOOPBACK|^lo' | awk '{print $1}' | head -n 1
+      register: active_interface
+      changed_when: false
+      when: 
+        - ansible_os_family == "RedHat" 
+        - ansible_distribution_major_version == "8"
+
+    # 4. 验证网卡是否获取成功
+    - name: Fail if no active interface found
+      fail:
+        msg: "未找到活跃的非回环网卡，请手动检查网络配置"
+      when: 
+        - ansible_os_family == "RedHat" 
+        - ansible_distribution_major_version == "8"
+        - active_interface.stdout | trim == ""
+
+    # 5. 持久化配置DNS
+    - name: Configure persistent DNS via NetworkManager
+      shell: |
+        nmcli connection modify "{{ active_interface.stdout }}" ipv4.dns "223.5.5.5 223.6.6.6 114.114.114.114"
+        nmcli connection up "{{ active_interface.stdout }}"
+      args:
+        executable: /bin/bash
+      when: 
+        - ansible_os_family == "RedHat" 
+        - ansible_distribution_major_version == "8"
+        - active_interface.stdout | trim != ""
+
+    # 6. 配置唯一的CentOS Stream 8仓库
+    - name: Create ONLY CentOS Stream 8 repo
+      copy:
+        content: |
+          [baseos]
+          name=CentOS Stream 8 - BaseOS
+          baseurl=https://vault.centos.org/centos/8-stream/BaseOS/x86_64/os/
+          gpgcheck=1
+          enabled=1
+          gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+
+          [appstream]
+          name=CentOS Stream 8 - AppStream
+          baseurl=https://vault.centos.org/centos/8-stream/AppStream/x86_64/os/
+          gpgcheck=1
+          enabled=1
+          gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+
+          [extras]
+          name=CentOS Stream 8 - Extras
+          baseurl=https://vault.centos.org/centos/8-stream/extras/x86_64/os/
+          gpgcheck=1
+          enabled=1
+          gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial
+        dest: /etc/yum.repos.d/CentOS-Stream-Only.repo
+        mode: '0644'
+      when: 
+        - ansible_os_family == "RedHat" 
+        - ansible_distribution_major_version == "8"
+
+    # 7. 手动安装EPEL官方源（修复404错误）
+    - name: Install and verify EPEL repo (official source)
+      shell: |
+        # 使用EPEL官方地址（替代阿里云）
+        wget -O /tmp/epel-release.rpm https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+        # 强制安装
+        rpm -ivh /tmp/epel-release.rpm --force
+        # 验证repo文件存在
+        if [ ! -f /etc/yum.repos.d/epel.repo ]; then
+          echo "EPEL repo file not found"
+          exit 1
+        fi
+        # 清理临时文件
+        rm -f /tmp/epel-release.rpm
+      args:
+        executable: /bin/bash
+      when: 
+        - ansible_os_family == "RedHat" 
+        - ansible_distribution_major_version == "8"
+
+    # 8. 彻底清理并重建YUM缓存
+    - name: 彻底清理并重建YUM缓存
+      shell: |
+        yum clean all
+        rm -rf /var/cache/yum/*
+        yum makecache --disablerepo=* --enablerepo=baseos --enablerepo=appstream --enablerepo=extras --enablerepo=epel
+      args:
+        executable: /bin/bash
+      when: 
+        - ansible_os_family == "RedHat" 
+        - ansible_distribution_major_version == "8"
+
+    # 9. 安装基础工具包
+    - name: Install basic tools (CentOS Stream 8)
+      yum:
+        name:
+          - wget
+          - vim
+          - net-tools
+          - lrzsz
+          - supervisor
+          - ansible
+          - unzip
+          - git
+          - chrony
+        state: present
+        enablerepo:
+          - baseos
+          - appstream
+          - extras
+          - epel
+      when: 
+        - ansible_os_family == "RedHat" 
+        - ansible_distribution_major_version == "8"
+
+    # 后续任务保持不变
+    - name: Stop and disable firewalld service
+      service:
+        name: firewalld
+        state: stopped
+        enabled: false
+      when: 
+        - ansible_os_family == "RedHat" 
+        - ansible_distribution_major_version == "8"
+
+    - name: Set timezone to Asia/Shanghai
+      timezone:
+        name: Asia/Shanghai
+
+    - name: Start and enable chronyd service
+      systemd:
+        name: chronyd
+        state: started
+        enabled: yes
+
+    - name: Configure Aliyun NTP servers
+      lineinfile:
+        path: /etc/chrony.conf
+        line: "{{ item }}"
+        regexp: "^server {{ item.split()[0] }}.*"
+        state: present
+      loop:
+        - "server ntp1.aliyun.com iburst"
+        - "server ntp2.aliyun.com iburst"
+
+    - name: Restart chronyd service
+      systemd:
+        name: chronyd
+        state: restarted
+
+    - name: Check chrony synchronization status
+      command: chronyc sources
+      register: chrony_sources
+
+    - name: Display synchronization status
+      debug:
+        var: chrony_sources.stdout_lines
+
+    - name: Clean trailing spaces in /etc/vimrc
+      replace:
+        path: /etc/vimrc
+        regexp: '\s+$'
+        replace: ''
+
+    - name: Prepare custom Vim settings
+      set_fact:
+        custom_vim_settings: "{{ temp_settings | regex_replace('\\s+$', '') | regex_replace('^\\s*$', '') }}"
+      vars:
+        temp_settings: |
+          set ignorecase
+          autocmd BufNewFile *.py,*.cc,*.sh,*.java exec ":call SetTitle()"
+          func! SetTitle()
+          if expand("%:e")=='sh'
+            call setline(1, "#!/bin/bash")
+            call setline(2,"##############################################################")
+            call setline(3, "# File Name:".expand("%"))
+            call setline(4, "# Version:V1.0")
+            call setline(5, "# Author:oranges_are_ripe.")
+            call setline(6, "# Organization:https://uniqueyouzhi.feishu.cn")
+            call setline(7, "# Desc:输入脚本作用")
+            call setline(8,"##############################################################")
+          endif
+          endfunc
+      register: temp_result
+      changed_when: false
+
+    - name: Append custom Vim settings to /etc/vimrc
+      blockinfile:
+        path: /etc/vimrc
+        block: "{{ custom_vim_settings }}"
+        state: present
+
+    - name: Remove ANSIBLE MANAGED BLOCK markers
+      replace:
+        path: /etc/vimrc
+        regexp: '^# (BEGIN|END) ANSIBLE MANAGED BLOCK$\n?'
+        replace: ''
+    
