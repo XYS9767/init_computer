@@ -65,9 +65,18 @@
     # 复制主机名IP配置脚本
     - name: Copy change_hostname_ip.sh script to /root
       copy:
-        src: /root/change_hostname_ip.sh
+        src: change_hostname_ip.sh
         dest: /root/change_hostname_ip.sh
         mode: '0755'
+
+    # 配置强制时间同步脚本
+    - name: Copy force_time_sync.sh script to /root
+      copy:
+        src: change_force_time_sync.sh
+        dest: /root/change_force_time_sync.sh
+        mode: '0755'
+
+
 
     # 设置时区为上海
     - name: Set timezone to Asia/Shanghai
